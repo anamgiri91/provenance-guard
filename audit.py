@@ -147,6 +147,23 @@ def get_log(limit: int = 50, offset: int = 0, verdict_filter: str = None) -> lis
     return entries
 
 
+def insert_appeal(appeal_id: str, submission_id: str, creator_id: str, reasoning: str,
+                   original_verdict: str, original_confidence: float) -> str:
+    ts = datetime.now(timezone.utc).isoformat()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO appeals
+              (appeal_id, submission_id, creator_id, reasoning, timestamp,
+               original_verdict, original_confidence)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (appeal_id, submission_id, creator_id, reasoning, ts, original_verdict, original_confidence),
+        )
+        conn.commit()
+    return ts
+
+
 def update_status(submission_id: str, new_status: str):
     with _connect() as conn:
         conn.execute(

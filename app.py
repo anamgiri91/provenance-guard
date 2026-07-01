@@ -1,16 +1,13 @@
 """
-Provenance Guard — Flask app (Milestone 3)
+Provenance Guard — Flask app (Milestone 5: production layer)
 
 Implemented:
-  POST /submit   — full pipeline with Signal 1 (LLM) live; Signal 2 stubbed
-  GET  /log      — returns structured audit log entries
+  POST /submit          — full pipeline: both signals + confidence engine + real labels
+  GET  /log              — structured audit log entries, joined with appeals
+  POST /appeal           — appeal workflow: validate, log, flip status to under_review
+  GET  /status/<id>      — lookup current verdict/status/appeal for a submission
 
-Stubbed (filled in M4/M5):
-  analyze_stylometrics()
-  compute_confidence()
-  generate_label()
-  POST /appeal
-  GET  /status/<id>
+Rate limiting: 10/minute, 100/day on POST /submit (Flask-Limiter, in-memory storage).
 """
 
 import hashlib
@@ -22,77 +19,126 @@ from flask import Flask, jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
-from audit import get_log, init_db, insert_submission
+from audit import (
+    get_appeal,
+    get_log,
+    get_submission,
+    init_db,
+    insert_appeal,
+    insert_submission,
+    update_status,
+)
 from signals import classify_with_llm
+from stylometrics import analyze_stylometrics
 
 app = Flask(__name__)
 
 limiter = Limiter(
-    key_func=get_remote_address,
+    get_remote_address,
     app=app,
-    default_limits=[],  # only apply limits where decorated
+    default_limits=[],
+    storage_uri="memory://",
 )
 
-# ---------------------------------------------------------------------------
-# Stubs — replaced in M4 / M5
-# ---------------------------------------------------------------------------
 
-def analyze_stylometrics(text: str) -> dict:
-    """M4 stub — returns None score so confidence engine uses LLM-only fallback."""
-    return {
-        "stylometric_score": None,
-        "detail": {},
-        "short_text_warning": False,
-    }
-
+# ---------------------------------------------------------------------------
+# Confidence Scoring Engine (M4 — full implementation)
+# ---------------------------------------------------------------------------
 
 def compute_confidence(llm_score, stylometric_score) -> dict:
     """
-    M3 implementation: LLM-only fallback (spec §1 fallback table).
-    Full weighted formula added in M4.
+    Combines Signal 1 (LLM) and Signal 2 (stylometric) per spec:
+      - Both present: weighted 0.65/0.35, with disagreement penalty if |diff| > 0.35
+      - Only LLM: capped at 0.65
+      - Only stylometric: capped at 0.60
+      - Neither: 0.5, forced uncertain
     """
     if llm_score is None and stylometric_score is None:
         return {"combined_score": 0.5, "verdict": "uncertain", "disagreement_flagged": False}
 
     if llm_score is not None and stylometric_score is None:
-        # Only LLM available — cap at 0.65 per spec
         score = min(llm_score, 0.65)
-        verdict = _score_to_verdict(score)
-        return {"combined_score": round(score, 4), "verdict": verdict, "disagreement_flagged": False}
+        return {"combined_score": round(score, 4), "verdict": _score_to_verdict(score), "disagreement_flagged": False}
 
-    # Full formula — used once M4 fills in stylometric_score
+    if llm_score is None and stylometric_score is not None:
+        score = min(stylometric_score, 0.60)
+        return {"combined_score": round(score, 4), "verdict": _score_to_verdict(score), "disagreement_flagged": False}
+
+    # --- Both signals present: full weighted formula ---
     combined = llm_score * 0.65 + stylometric_score * 0.35
     disagreement = abs(llm_score - stylometric_score) > 0.35
     if disagreement:
         combined = combined * 0.85 + 0.5 * 0.15
-    verdict = _score_to_verdict(combined)
+
+    combined = max(0.0, min(combined, 1.0))
     return {
         "combined_score": round(combined, 4),
-        "verdict": verdict,
+        "verdict": _score_to_verdict(combined),
         "disagreement_flagged": disagreement,
     }
 
 
+
+
 def _score_to_verdict(score: float) -> str:
-    """Spec threshold table."""
+    """
+    Spec threshold table (5 bands):
+      0.00-0.28  human   (high-confidence human)
+      0.29-0.42  human   (lean-human, still cautious label)
+      0.43-0.72  uncertain
+      0.73-0.87  ai      (lean-AI, still cautious label)
+      0.88-1.00  ai      (high-confidence ai)
+    """
     if score <= 0.42:
         return "human"
-    if score <= 0.72:
-        return "uncertain"
+    if score <= 0.87:
+        return "uncertain" if score <= 0.72 else "ai"
     return "ai"
 
 
 def generate_label(combined_score: float, verdict: str) -> str:
-    """M3 stub — placeholder strings; verbatim spec labels added in M5."""
+    """
+    Maps combined_score to one of five verbatim label variants per spec.
+    Text must match exactly — these are shown directly to readers.
+    """
     if combined_score <= 0.28:
-        return "✓ This content appears to be human-authored."
+        return (
+            "✓ This content appears to be human-authored.\n\n"
+            "Our analysis found no strong indicators of AI generation. "
+            "This label reflects our best assessment — not a guarantee."
+        )
     if combined_score <= 0.42:
-        return "~ Authorship unclear — likely human. (placeholder)"
+        return (
+            "~ Authorship unclear — likely human.\n\n"
+            "Our analysis found more human-like patterns than AI-like ones, but the "
+            "evidence isn't strong enough for a confident assessment. Some human writing "
+            "styles can resemble AI output. If you're the creator and believe this label "
+            "is wrong, you can submit an appeal."
+        )
     if combined_score <= 0.72:
-        return "~ Authorship unclear. (placeholder)"
+        return (
+            "~ Authorship unclear.\n\n"
+            "Our analysis couldn't confidently determine whether this content was written "
+            "by a human or generated by AI. This does not mean the content is AI-generated "
+            "— it means our system is uncertain. If you're the creator and believe this "
+            "label is inaccurate, you can submit an appeal."
+        )
     if combined_score <= 0.87:
-        return "~ Authorship unclear — some AI-like patterns detected. (placeholder)"
-    return "⚠ This content shows strong indicators of AI generation. (placeholder)"
+        return (
+            "~ Authorship unclear — some AI-like patterns detected.\n\n"
+            "Our analysis found patterns that appear more often in AI-generated content "
+            "than in human writing, but we're not confident enough to make a definitive "
+            "call. Some human writing — especially formal, polished, or conventionally "
+            "structured work — can resemble AI output. If this is your original work, you "
+            "can submit an appeal."
+        )
+    return (
+        "⚠ This content shows strong indicators of AI generation.\n\n"
+        "Our analysis found consistent patterns across multiple signals that are "
+        "characteristic of AI-generated text. This label reflects our best assessment — "
+        "it is not a guaranteed determination. If you believe this is incorrect, you can "
+        "submit an appeal."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +146,7 @@ def generate_label(combined_score: float, verdict: str) -> str:
 # ---------------------------------------------------------------------------
 
 @app.post("/submit")
-@limiter.limit("30 per minute")
+@limiter.limit("10 per minute;100 per day")
 def submit():
     body = request.get_json(silent=True)
     if not body or not body.get("content"):
@@ -119,7 +165,7 @@ def submit():
     llm_score = llm_result["llm_score"]
     llm_reasoning = llm_result["reasoning"]
 
-    # --- Signal 2: Stylometrics (stubbed in M3) ---
+    # --- Signal 2: Stylometric analyzer ---
     stylo_result = analyze_stylometrics(raw_text)
     stylometric_score = stylo_result["stylometric_score"]
     short_text_warning = stylo_result["short_text_warning"]
@@ -172,12 +218,103 @@ def log():
     return jsonify({"count": len(entries), "entries": entries})
 
 
+@app.post("/appeal")
+def appeal():
+    body = request.get_json(silent=True)
+    if not body:
+        return jsonify({"error": "Request body must be valid JSON."}), 400
+
+    submission_id = body.get("submission_id") or body.get("content_id")
+    creator_id = body.get("creator_id")
+    reasoning = body.get("reasoning") or body.get("creator_reasoning")
+
+    if not submission_id or not creator_id or not reasoning:
+        return jsonify({
+            "error": "Request must include 'submission_id' (or 'content_id'), "
+                     "'creator_id', and 'reasoning' (or 'creator_reasoning')."
+        }), 400
+
+    if not (10 <= len(reasoning) <= 2000):
+        return jsonify({"error": "'reasoning' must be between 10 and 2000 characters."}), 400
+
+    # 1. Validate submission exists
+    record = get_submission(submission_id)
+    if record is None:
+        return jsonify({"error": f"No submission found with id '{submission_id}'."}), 404
+
+    # 2. Validate no prior appeal exists
+    existing = get_appeal(submission_id)
+    if existing is not None:
+        return jsonify({
+            "error": "An appeal already exists for this submission.",
+            "existing_appeal": {
+                "appeal_id": existing["appeal_id"],
+                "submission_id": existing["submission_id"],
+                "creator_id": existing["creator_id"],
+                "reasoning": existing["reasoning"],
+                "timestamp": existing["timestamp"],
+            },
+        }), 409
+
+    # 3. Write appeal entry
+    appeal_id = str(uuid.uuid4())
+    ts = insert_appeal(
+        appeal_id=appeal_id,
+        submission_id=submission_id,
+        creator_id=creator_id,
+        reasoning=reasoning,
+        original_verdict=record["verdict"],
+        original_confidence=record["confidence"],
+    )
+
+    # 4. Update status: classified -> under_review
+    update_status(submission_id, "under_review")
+
+    # 5. Return confirmation
+    return jsonify({
+        "appeal_id": appeal_id,
+        "submission_id": submission_id,
+        "status": "under_review",
+        "message": "Your appeal has been received and logged. A human moderator will review "
+                    "the original decision alongside your explanation.",
+        "timestamp": ts,
+    })
+
+
+@app.get("/status/<submission_id>")
+def status(submission_id):
+    record = get_submission(submission_id)
+    if record is None:
+        return jsonify({"error": f"No submission found with id '{submission_id}'."}), 404
+
+    appeal_record = get_appeal(submission_id)
+    appeal_payload = None
+    if appeal_record:
+        appeal_payload = {
+            "appeal_id": appeal_record["appeal_id"],
+            "creator_id": appeal_record["creator_id"],
+            "reasoning": appeal_record["reasoning"],
+            "timestamp": appeal_record["timestamp"],
+        }
+
+    return jsonify({
+        "submission_id": record["submission_id"],
+        "verdict": record["verdict"],
+        "confidence": record["confidence"],
+        "label": record["label"],
+        "status": record["status"],
+        "appeal": appeal_payload,
+    })
+
+
 # ---------------------------------------------------------------------------
-# Startup
+# Startup — init DB on every load (safe to call multiple times)
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+with app.app_context():
     init_db()
+
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"[provenance-guard] Starting on http://localhost:{port}")
     app.run(debug=True, port=port)
